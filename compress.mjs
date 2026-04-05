@@ -20,8 +20,12 @@
 const MAX_CHARS = 2000
 const MIN_CHARS = 500
 
-// Tools that should never be compressed (output is small or essential)
-const SKIP_TOOLS = new Set(['Edit', 'Write', 'TodoWrite', 'TaskCreate', 'TaskUpdate',
+// Tools that should never be compressed
+// - Edit/Write: output is small, always essential
+// - Read: Claude needs full file content to make edits (94% of edits target the middle
+//   of files — compressing it would cause hallucinations and failed edits)
+// - Agent/Task/Skill: control flow, not content
+const SKIP_TOOLS = new Set(['Edit', 'Write', 'Read', 'TodoWrite', 'TaskCreate', 'TaskUpdate',
   'TaskGet', 'Skill', 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
   'NotebookEdit', 'Agent'])
 

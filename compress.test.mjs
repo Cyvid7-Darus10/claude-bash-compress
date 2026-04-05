@@ -78,26 +78,16 @@ test('Glob: truncates long file lists', () => {
   assert.ok(r.additionalContext?.includes('200 total'))
 })
 
-// ── Read ──
+// ── Read (never compressed — Claude needs full content to edit) ──
 
-test('Read: passes through small files', () => {
+test('Read: never compressed (small files)', () => {
   const content = Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n')
   assert.deepStrictEqual(run({ tool_name: 'Read', tool_response: content }), {})
 })
 
-test('Read: trims very large files', () => {
+test('Read: never compressed (large files)', () => {
   const lines = Array.from({ length: 300 }, (_, i) => `  ${i + 1}\tconst x${i} = "some value that makes this line longer for testing purposes"`)
-  const r = run({ tool_name: 'Read', tool_response: lines.join('\n') })
-  assert.ok(r.additionalContext?.includes('lines omitted from middle'))
-  assert.ok(r.additionalContext?.includes('compress: Read'))
-})
-
-test('Read: preserves moderate files (<100 lines)', () => {
-  const lines = Array.from({ length: 80 }, (_, i) => `  ${i}\tcode line ${i}`)
-  const content = lines.join('\n') + '\n'.repeat(50) // pad to >5k chars
-  if (content.length < 5000) {
-    assert.deepStrictEqual(run({ tool_name: 'Read', tool_response: content }), {})
-  }
+  assert.deepStrictEqual(run({ tool_name: 'Read', tool_response: lines.join('\n') }), {})
 })
 
 // ── WebFetch ──
