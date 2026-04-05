@@ -1,38 +1,44 @@
 #!/usr/bin/env node
 
 /**
- * claude-compress — Compress verbose tool output in Claude Code sessions.
+ * claude-savings — Save tokens in Claude Code sessions.
  *
- * A PostToolUse hook that reduces noisy output from Bash, Grep, Glob,
- * WebFetch, WebSearch, and Read before it bloats your context window.
+ * A PostToolUse hook with three savings strategies:
  *
- * Each tool type has a tailored compression strategy:
- * - Bash:      Strip progress bars, collapse repeats, keep errors
- * - Grep:      Truncate after N matches, preserve match count
- * - Glob:      Truncate long file lists, show total count
- * - Read:      Trim very large files, keep head/tail
- * - WebFetch:  Strip HTML tags, truncate to content
- * - WebSearch: Truncate verbose result blocks
+ * 1. OUTPUT COMPRESSION — Reduces noisy output from Bash, Grep, Glob,
+ *    WebFetch, WebSearch before it bloats the context window.
  *
- * MIT License — https://github.com/Cyvid7-Darus10/claude-bash-compress
+ * 2. LOOP DETECTION — Warns when Claude repeats the same failing
+ *    command, preventing 10-50k tokens wasted per loop.
+ *
+ * 3. DUPLICATE READ TRACKING — Warns when Claude re-reads a file
+ *    it already has in context, preventing full file duplication.
+ *
+ * MIT License — https://github.com/Cyvid7-Darus10/claude-savings
  */
+
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { createHash } from 'node:crypto'
 
 const MAX_CHARS = 2000
 const MIN_CHARS = 500
+const STATE_DIR = resolve(homedir(), '.claude-savings')
+const LOOP_THRESHOLD = 3
 
 // Tools that should never be compressed
-// - Edit/Write: output is small, always essential
-// - Read: Claude needs full file content to make edits (94% of edits target the middle
-//   of files — compressing it would cause hallucinations and failed edits)
-// - Agent/Task/Skill: control flow, not content
-const SKIP_TOOLS = new Set(['Edit', 'Write', 'Read', 'TodoWrite', 'TaskCreate', 'TaskUpdate',
-  'TaskGet', 'Skill', 'ToolSearch', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
-  'NotebookEdit', 'Agent'])
+// Read: Claude needs full file content to edit (94% of edits target the middle)
+const SKIP_COMPRESS = new Set(['Edit', 'Write', 'Read', 'TodoWrite', 'TaskCreate',
+  'TaskUpdate', 'TaskGet', 'Skill', 'ToolSearch', 'AskUserQuestion',
+  'EnterPlanMode', 'ExitPlanMode', 'NotebookEdit', 'Agent'])
 
 const ERROR_PATTERNS = [/error/i, /warn/i, /fail/i, /exception/i, /✗/, /ENOENT/, /EACCES/,
   /TypeError/, /SyntaxError/, /ReferenceError/, /Cannot find/]
 
-// ── Per-tool compression strategies ──────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// 1. OUTPUT COMPRESSION
+// ═══════════════════════════════════════════════════════════════════
 
 function compressBash(output) {
   const lines = output.split('\n')
@@ -44,7 +50,7 @@ function compressBash(output) {
 
   const collapsed = collapseRepeats(filtered)
 
-  // Package manager output — summarize heavily
+  // Package manager output
   if (/added \d+ packages?/i.test(output) || /packages? are looking for funding/i.test(output)) {
     const head = collapsed.slice(0, 5), tail = collapsed.slice(-5)
     const parts = [...head, '', `[... ${Math.max(0, collapsed.length - 10)} lines of install output omitted ...]`, '']
@@ -57,7 +63,53 @@ function compressBash(output) {
     return parts.join('\n')
   }
 
-  // Build/general output — keep error/warn lines
+  // Smart stack trace compression — collapse node_modules frames
+  const appFrames = []
+  const frameworkCount = { count: 0 }
+  let inStackTrace = false
+
+  for (const line of collapsed) {
+    const isFrame = /^\s+at\s/.test(line)
+    if (isFrame) {
+      inStackTrace = true
+      if (/node_modules/.test(line) || /internal\//.test(line)) {
+        frameworkCount.count++
+      } else {
+        if (frameworkCount.count > 0) {
+          appFrames.push(`    (+ ${frameworkCount.count} framework frames hidden)`)
+          frameworkCount.count = 0
+        }
+        appFrames.push(line)
+      }
+    } else {
+      if (inStackTrace && frameworkCount.count > 0) {
+        appFrames.push(`    (+ ${frameworkCount.count} framework frames hidden)`)
+        frameworkCount.count = 0
+      }
+      inStackTrace = false
+      appFrames.push(line)
+    }
+  }
+  if (frameworkCount.count > 0) {
+    appFrames.push(`    (+ ${frameworkCount.count} framework frames hidden)`)
+  }
+
+  // If stack trace compression saved lines, use it
+  if (appFrames.length < collapsed.length) {
+    const important = appFrames.filter(l => ERROR_PATTERNS.some(p => p.test(l)))
+    if (important.length > 0 && important.length < appFrames.length * 0.5) {
+      return [
+        ...appFrames.slice(0, 5),
+        `\n[... ${Math.max(0, appFrames.length - 10)} lines omitted, ${important.length} important lines below ...]\n`,
+        ...important,
+        '\n[... end of important lines ...]\n',
+        ...appFrames.slice(-5),
+      ].join('\n')
+    }
+    return appFrames.join('\n')
+  }
+
+  // General: keep error/warn lines
   const important = collapsed.filter(l => ERROR_PATTERNS.some(p => p.test(l)))
   if (important.length > 0 && important.length < collapsed.length * 0.5) {
     return [
@@ -74,58 +126,17 @@ function compressBash(output) {
 
 function compressGrep(output) {
   const lines = output.split('\n').filter(Boolean)
-  if (lines.length <= 30) return null // Already manageable
-
-  const head = lines.slice(0, 15)
-  const tail = lines.slice(-5)
-  return [
-    ...head,
-    '',
-    `[... ${lines.length - 20} more matches omitted (${lines.length} total) ...]`,
-    '',
-    ...tail,
-  ].join('\n')
+  if (lines.length <= 30) return null
+  return [...lines.slice(0, 15), '', `[... ${lines.length - 20} more matches omitted (${lines.length} total) ...]`, '', ...lines.slice(-5)].join('\n')
 }
 
 function compressGlob(output) {
   const lines = output.split('\n').filter(Boolean)
   if (lines.length <= 30) return null
-
-  const head = lines.slice(0, 20)
-  return [
-    ...head,
-    '',
-    `[... ${lines.length - 20} more files omitted (${lines.length} total) ...]`,
-  ].join('\n')
-}
-
-function compressRead(output) {
-  // Only compress very large reads (>5k chars)
-  // Be conservative — Claude often needs file content to make edits
-  if (output.length < 5000) return null
-
-  const lines = output.split('\n')
-  if (lines.length <= 100) return null
-
-  // Scale kept lines to fit within MAX_CHARS
-  // Keep ~60% head, ~30% tail, proportional to max budget
-  const maxLines = Math.min(40, Math.floor(lines.length * 0.3))
-  const headLines = Math.floor(maxLines * 0.65)
-  const tailLines = maxLines - headLines
-  const head = lines.slice(0, headLines)
-  const tail = lines.slice(-tailLines)
-  return [
-    ...head,
-    '',
-    `[... ${lines.length - headLines - tailLines} lines omitted from middle of file (${lines.length} lines total, ${(output.length / 1000).toFixed(1)}k chars) ...]`,
-    `[... if you need the full file, use Read with offset/limit parameters ...]`,
-    '',
-    ...tail,
-  ].join('\n')
+  return [...lines.slice(0, 20), '', `[... ${lines.length - 20} more files omitted (${lines.length} total) ...]`].join('\n')
 }
 
 function compressWebFetch(output) {
-  // Strip HTML tags if present
   let text = output
   if (/<[a-z][\s\S]*>/i.test(text)) {
     text = text
@@ -135,65 +146,112 @@ function compressWebFetch(output) {
       .replace(/\s{2,}/g, ' ')
       .trim()
   }
-
-  // Collapse whitespace-heavy content
   const lines = text.split('\n').filter(l => l.trim().length > 0)
   if (lines.length <= 30) return lines.join('\n')
-
-  const head = lines.slice(0, 20)
-  const tail = lines.slice(-10)
-  return [
-    ...head,
-    '',
-    `[... ${lines.length - 30} lines of web content omitted (${lines.length} total) ...]`,
-    '',
-    ...tail,
-  ].join('\n')
+  return [...lines.slice(0, 20), '', `[... ${lines.length - 30} lines of web content omitted (${lines.length} total) ...]`, '', ...lines.slice(-10)].join('\n')
 }
 
 function compressWebSearch(output) {
   const lines = output.split('\n').filter(l => l.trim().length > 0)
   if (lines.length <= 40) return null
-
-  const head = lines.slice(0, 30)
-  return [
-    ...head,
-    '',
-    `[... ${lines.length - 30} more lines omitted (${lines.length} total) ...]`,
-  ].join('\n')
+  return [...lines.slice(0, 30), '', `[... ${lines.length - 30} more lines omitted (${lines.length} total) ...]`].join('\n')
 }
-
-// ── Generic fallback ─────────────────────────────────────────────
 
 function compressGeneric(output) {
   const lines = output.split('\n')
   const collapsed = collapseRepeats(lines)
-
   const important = collapsed.filter(l => ERROR_PATTERNS.some(p => p.test(l)))
   if (important.length > 0 && important.length < collapsed.length * 0.5) {
-    return [
-      ...collapsed.slice(0, 5),
-      `\n[... ${Math.max(0, collapsed.length - 10)} lines omitted, ${important.length} important lines below ...]\n`,
-      ...important,
-      ...collapsed.slice(-5),
-    ].join('\n')
+    return [...collapsed.slice(0, 5), `\n[... ${Math.max(0, collapsed.length - 10)} lines omitted, ${important.length} important lines below ...]\n`, ...important, ...collapsed.slice(-5)].join('\n')
   }
-
-  // Just head + tail for long output
   if (collapsed.length > 50) {
-    return [
-      ...collapsed.slice(0, 20),
-      '',
-      `[... ${collapsed.length - 30} lines omitted (${collapsed.length} total) ...]`,
-      '',
-      ...collapsed.slice(-10),
-    ].join('\n')
+    return [...collapsed.slice(0, 20), '', `[... ${collapsed.length - 30} lines omitted (${collapsed.length} total) ...]`, '', ...collapsed.slice(-10)].join('\n')
   }
-
   return collapsed.join('\n')
 }
 
-// ── Shared utilities ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// 2. LOOP DETECTION
+// ═══════════════════════════════════════════════════════════════════
+
+function detectLoop(sessionId, toolName, toolInput, toolResponse) {
+  const stateFile = resolve(STATE_DIR, 'loop-state.json')
+  let state = readState(stateFile, {})
+
+  // Hash the tool call signature
+  const hash = createHash('sha256')
+    .update(toolName + '|' + JSON.stringify(toolInput || '') + '|' + (toolResponse || '').slice(0, 500))
+    .digest('hex')
+    .slice(0, 16)
+
+  const key = sessionId || 'default'
+  if (!state[key]) state[key] = { lastHash: '', count: 0, warned: {} }
+
+  if (state[key].lastHash === hash) {
+    state[key].count++
+  } else {
+    state[key].lastHash = hash
+    state[key].count = 1
+  }
+
+  writeState(stateFile, state)
+
+  if (state[key].count >= LOOP_THRESHOLD && !state[key].warned[hash]) {
+    state[key].warned[hash] = true
+    writeState(stateFile, state)
+
+    const cmd = typeof toolInput?.command === 'string' ? toolInput.command.slice(0, 80) : toolName
+    return `[savings: LOOP DETECTED] "${cmd}" has produced the same result ${state[key].count} times. ` +
+      `This is wasting tokens. Stop and try a different approach — read the error, check assumptions, or ask the user for help.`
+  }
+
+  return null
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 3. DUPLICATE READ TRACKING
+// ═══════════════════════════════════════════════════════════════════
+
+function trackDuplicateRead(sessionId, toolName, toolInput, outputLength) {
+  if (toolName !== 'Read') return null
+
+  const filePath = toolInput?.file_path
+  if (!filePath) return null
+
+  // Only warn for substantial reads (>1k chars)
+  if (outputLength < 1000) return null
+
+  const stateFile = resolve(STATE_DIR, 'read-state.json')
+  let state = readState(stateFile, {})
+
+  const key = sessionId || 'default'
+  if (!state[key]) state[key] = {}
+
+  const shortPath = filePath.split('/').slice(-3).join('/')
+
+  if (state[key][filePath]) {
+    const count = state[key][filePath] + 1
+    state[key][filePath] = count
+
+    // Only warn on 2nd read, not every subsequent one
+    if (count === 2) {
+      writeState(stateFile, state)
+      return `[savings: DUPLICATE READ] ${shortPath} was already read in this session (${(outputLength / 1000).toFixed(1)}k chars re-added to context). ` +
+        `The file content is already in your conversation history. If you need specific lines, use Read with offset/limit instead of re-reading the whole file.`
+    }
+
+    writeState(stateFile, state)
+    return null
+  }
+
+  state[key][filePath] = 1
+  writeState(stateFile, state)
+  return null
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Shared utilities
+// ═══════════════════════════════════════════════════════════════════
 
 function collapseRepeats(lines) {
   const result = []
@@ -210,47 +268,49 @@ function collapseRepeats(lines) {
 
 function truncate(text, max) {
   if (text.length <= max) return text
-  const h = Math.floor(max * 0.4)
-  const t = Math.floor(max * 0.4)
-  return text.slice(0, h) +
-    `\n\n[... truncated ${text.length - h - t} chars ...]\n\n` +
-    text.slice(-t)
+  const h = Math.floor(max * 0.4), t = Math.floor(max * 0.4)
+  return text.slice(0, h) + `\n\n[... truncated ${text.length - h - t} chars ...]\n\n` + text.slice(-t)
 }
 
-// ── Main compression entry point ─────────────────────────────────
+function readState(file, fallback) {
+  try { return JSON.parse(readFileSync(file, 'utf-8')) } catch { return fallback }
+}
+
+function writeState(file, data) {
+  try { mkdirSync(STATE_DIR, { recursive: true }); writeFileSync(file, JSON.stringify(data)) } catch {}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Main compression entry point
+// ═══════════════════════════════════════════════════════════════════
 
 function compress(toolName, output) {
   if (!output || output.length < MIN_CHARS) return null
-  if (SKIP_TOOLS.has(toolName)) return null
+  if (SKIP_COMPRESS.has(toolName)) return null
 
-  // Select strategy — Read gets a higher budget since Claude needs file content
-  const maxChars = toolName === 'Read' ? 4000 : MAX_CHARS
   let result
   switch (toolName) {
     case 'Bash':      result = compressBash(output); break
     case 'Grep':      result = compressGrep(output); break
     case 'Glob':      result = compressGlob(output); break
-    case 'Read':      result = compressRead(output); break
     case 'WebFetch':  result = compressWebFetch(output); break
     case 'WebSearch': result = compressWebSearch(output); break
     default:          result = compressGeneric(output); break
   }
 
   if (!result) return null
-
-  // Final truncation safety net
-  result = truncate(result, maxChars)
-
-  // Only return if we actually saved space
+  result = truncate(result, MAX_CHARS)
   if (result.length >= output.length) return null
 
   const origK = (output.length / 1000).toFixed(1)
   const compK = (result.length / 1000).toFixed(1)
   const pct = Math.round((1 - result.length / output.length) * 100)
-  return `[compress: ${toolName} ${origK}k → ${compK}k chars (${pct}% saved)]\n${result}`
+  return `[savings: ${toolName} compressed ${origK}k → ${compK}k chars (${pct}% saved)]\n${result}`
 }
 
-// ── Hook entry point ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Hook entry point
+// ═══════════════════════════════════════════════════════════════════
 
 let data = ''
 process.stdin.setEncoding('utf-8')
@@ -259,17 +319,24 @@ process.stdin.on('end', () => {
   try {
     const input = JSON.parse(data)
     const toolName = input.tool_name || ''
-
-    if (SKIP_TOOLS.has(toolName)) {
-      process.stdout.write('{}')
-      return
-    }
-
+    const sessionId = input.session_id || ''
     const output = input.tool_response || ''
-    const compressed = compress(toolName, output)
+    const parts = []
 
-    if (compressed) {
-      process.stdout.write(JSON.stringify({ additionalContext: compressed }))
+    // 1. Compression
+    const compressed = compress(toolName, output)
+    if (compressed) parts.push(compressed)
+
+    // 2. Loop detection (all tools)
+    const loopWarning = detectLoop(sessionId, toolName, input.tool_input, output)
+    if (loopWarning) parts.push(loopWarning)
+
+    // 3. Duplicate read tracking
+    const dupWarning = trackDuplicateRead(sessionId, toolName, input.tool_input, output.length)
+    if (dupWarning) parts.push(dupWarning)
+
+    if (parts.length > 0) {
+      process.stdout.write(JSON.stringify({ additionalContext: parts.join('\n\n') }))
     } else {
       process.stdout.write('{}')
     }
@@ -278,5 +345,4 @@ process.stdin.on('end', () => {
   }
 })
 
-// Export for testing
-export { compress, compressBash, compressGrep, compressGlob, compressRead, compressWebFetch, compressWebSearch }
+export { compress, compressBash, compressGrep, compressGlob, compressWebFetch, compressWebSearch, detectLoop, trackDuplicateRead }
