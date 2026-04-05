@@ -132,7 +132,19 @@ Rare in normal usage (0 times in our 107-session benchmark), but when it fires i
 | 50 devs | Opus | $3,000 | **$36,000** |
 | 200 devs | Opus | $12,000 | **$144,000** |
 
-> Assumes ~1M tokens saved per dev per week (typical for developers using multiple machines). Teams with heavier build/test cycles save more.
+> Assumes ~1M tokens saved per dev per week. For context, [Anthropic reports](https://www.theregister.com/2026/03/31/anthropic_claude_code_limits/) the average developer spends $100-200/month on Claude Code tokens — these savings represent a 5-10% reduction in total token spend.
+
+### The problem in numbers
+
+According to [Anthropic's own data](https://www.theregister.com/2026/03/31/anthropic_claude_code_limits/) and [independent analysis](https://www.faros.ai/blog/claude-code-token-limits):
+
+- The average Claude Code developer spends **~$6/day** ($100-200/month) on tokens
+- A session that starts at 5k tokens can **balloon to 50k+ after 30 minutes** — each turn re-sends the full history
+- Claude Code burns tokens at **10-100x the rate of chat** due to tool-use round trips
+- Users regularly hit their 5-hour session limits in **under 90 minutes** due to context bloat
+- In March 2026, a [prompt caching bug](https://www.roborhythms.com/claude-code-rate-limit-draining-march-2026/) caused some users to burn **10-20x more tokens than normal**
+
+Every token we prevent from entering context (blocked duplicate reads) or reduce in size (compression) compounds across every subsequent turn.
 
 ### How this makes Claude Code faster
 
