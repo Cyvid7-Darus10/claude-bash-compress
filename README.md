@@ -10,10 +10,10 @@ claude-savings is a two-hook system for Claude Code: a PreToolUse hook that bloc
 
 ## Real impact
 
-Measured from 107 real Claude Code sessions on a single machine (7 days). If you code across multiple machines, your savings scale proportionally — install the hook on each one.
+Measured from 107 real Claude Code sessions on **one of three machines** over 7 days. The developer also codes on a Mac Mini and a second laptop — this data captures roughly a third of total usage.
 
 ```
-  SAVINGS BREAKDOWN
+  SAVINGS (measured on one machine, 7 days)
   ─────────────────────────────────────────────────────
   Strategy                  Instances    Tokens saved/week
   ─────────────────────────────────────────────────────
@@ -21,9 +21,12 @@ Measured from 107 real Claude Code sessions on a single machine (7 days). If you
   Duplicate read blocking        68           ~99,000
   Loop detection                  —          (insurance)
   ─────────────────────────────────────────────────────
-  TOTAL                                      ~363,000
-  Per month                               ~1,452,000
+  This machine:                              ~363,000
+  Estimated all machines:                  ~1,000,000+
+  Per month (all machines):               ~4,000,000+
 ```
+
+Run `node benchmark.mjs` on each machine to see your actual numbers.
 
 Run the benchmark on your own sessions:
 
@@ -116,19 +119,20 @@ Rare in normal usage (0 times in our 107-session benchmark), but when it fires i
 
 | Model | Tokens saved/month | Cost saved/month |
 |---|---|---|
-| Claude Sonnet 4.6 | ~1.45M | **$4.36** |
-| Claude Opus 4.6 | ~1.45M | **$21.78** |
+| Claude Sonnet 4.6 | ~4M | **$12** |
+| Claude Opus 4.6 | ~4M | **$60** |
+
+> Single-machine measurement: ~363k tokens/week. Multi-machine developer (3 machines): ~1M tokens/week. Your mileage depends on session count and tool usage — run `node benchmark.mjs` on each machine.
 
 ### At scale
 
 | Team size | Model | Cost saved/month | Cost saved/year |
 |---|---|---|---|
-| 10 devs | Sonnet | $44 | **$523** |
-| 10 devs | Opus | $218 | **$2,614** |
-| 50 devs | Opus | $1,089 | **$13,068** |
-| 200 devs | Opus | $4,356 | **$52,272** |
+| 10 devs | Opus | $600 | **$7,200** |
+| 50 devs | Opus | $3,000 | **$36,000** |
+| 200 devs | Opus | $12,000 | **$144,000** |
 
-> Based on measured data from a single machine: ~363k tokens saved per week (264k from compression + 99k from blocked duplicate reads). Developers working across multiple machines will see proportionally higher savings — install on each machine and run `node benchmark.mjs` to measure.
+> Assumes ~1M tokens saved per dev per week (typical for developers using multiple machines). Teams with heavier build/test cycles save more.
 
 ### How this makes Claude Code faster
 
