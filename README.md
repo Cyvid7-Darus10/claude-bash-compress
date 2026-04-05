@@ -2,9 +2,9 @@
 
 **The #1 token waste in Claude Code isn't verbose output — it's Claude re-reading files it already has in context.**
 
-We measured 107 real sessions and found that duplicate file reads waste **more tokens than all verbose bash/grep/web output combined**. No other tool catches this.
+We measured 107 real sessions and found that duplicate file reads waste **more tokens than all verbose bash/grep/web output combined**. No other tool catches this — and we don't just warn about it, we **block it before it happens**.
 
-claude-savings is a single-file Claude Code hook with three savings strategies: output compression, duplicate read prevention, and loop detection. One file, zero dependencies, 580k tokens saved per week — measured, not estimated.
+claude-savings is a two-hook system for Claude Code: a PreToolUse hook that blocks duplicate reads, and a PostToolUse hook for output compression and loop detection. Two files, zero dependencies, ~580k tokens saved per week — measured, not estimated.
 
 ![demo](https://vhs.charm.sh/vhs-XbmoXiyGHgFy0WwjYYjis.gif)
 
@@ -15,17 +15,15 @@ Measured from 107 real Claude Code sessions (7 days):
 ```
   SAVINGS BREAKDOWN
   ─────────────────────────────────────────────────────
-  Strategy              Instances    Tokens saved/week
+  Strategy                  Instances    Tokens saved/week
   ─────────────────────────────────────────────────────
-  Output compression        287          ~264,000
-  Duplicate read warnings   309          ~316,000
-  Loop detection              —          (insurance)
+  Duplicate read blocking       309          ~316,000
+  Output compression            287          ~264,000
+  Loop detection                  —          (insurance)
   ─────────────────────────────────────────────────────
-  TOTAL                                  ~580,000
-  Per month                           ~2,317,000
+  TOTAL                                      ~580,000
+  Per month                               ~2,317,000
 ```
-
-Duplicate reads are the #1 waste — Claude re-reading files already in context adds the full file content to the conversation a second time. This happens ~309 times per week in normal usage.
 
 Run the benchmark on your own sessions:
 
@@ -35,19 +33,47 @@ node benchmark.mjs
 
 ## Three savings strategies
 
-### 1. Output compression (77% average reduction)
+### 1. Duplicate Read blocking — the big one (~316k tokens/week)
 
-Compresses verbose output from Bash, Grep, Glob, WebFetch, and WebSearch with per-tool strategies:
+Claude re-reads files it already has in context. A lot. We measured **309 duplicate reads per week** in normal usage. Each one adds the full file content to the conversation again — completely wasted tokens.
+
+Other tools warn about this. We **block it**.
+
+```
+  Claude tries to Read src/auth.ts (already read 40 turns ago)
+  ┌──────────────────────────────────────────────────────┐
+  │  BLOCKED by claude-savings                           │
+  │                                                      │
+  │  src/auth.ts was already read in this session with   │
+  │  the same parameters. The file content is already    │
+  │  in your conversation context — scroll up to find    │
+  │  it.                                                 │
+  └──────────────────────────────────────────────────────┘
+  → Zero tokens wasted. Claude uses the content already in context.
+```
+
+How it works:
+- **PreToolUse hook** intercepts Read calls before they execute
+- Tracks which files were read per session (with offset/limit params)
+- Exact same read = **blocked** with `decision: "block"`
+- Different offset/limit = allowed (intentional partial re-reads)
+- State stored in `~/.claude-savings/read-cache.json`
+
+> **Why not compress Read output instead?** We tested it. 94% of edits to large files target the middle — exactly the part compression would strip. Compressing Read would cause Claude to hallucinate or fail on nearly every edit. We measured this against 316 real Read→Edit sequences. Blocking duplicates is the right approach — it saves the same tokens without breaking anything.
+
+### 2. Output compression (77% average reduction, ~264k tokens/week)
+
+PostToolUse hook that compresses verbose output from Bash, Grep, Glob, WebFetch, and WebSearch:
 
 | Tool | Strategy | What's kept | What's stripped |
 |---|---|---|---|
 | **Bash** | Strip noise, collapse stack traces | Errors, warnings, app-level frames | Progress bars, repeated lines, node_modules frames |
-| **Grep** | Truncate matches | First 15 + last 5 matches, total count | Excess matches beyond 30 |
+| **Grep** | Truncate matches | First 15 + last 5, total count | Excess matches beyond 30 |
 | **Glob** | Truncate file lists | First 20 files, total count | Excess files beyond 30 |
-| **WebFetch** | Strip HTML, truncate | Text content, first 20 + last 10 lines | `<script>`, `<style>`, HTML tags |
+| **WebFetch** | Strip HTML, truncate | Text content, head + tail | `<script>`, `<style>`, HTML tags |
 | **WebSearch** | Truncate results | First 30 results | Excess results |
 
-Smart stack trace handling — collapses `node_modules` and `internal/` frames while keeping your application frames:
+Smart stack trace handling — collapses `node_modules` and `internal/` frames:
 
 ```
   Before (30 lines):                 After (5 lines):
@@ -57,34 +83,19 @@ Smart stack trace handling — collapses `node_modules` and `internal/` frames w
     at Layer.handle (node_modules/     (+ 28 framework frames hidden)
       express/lib/router/layer.js)   Process exited with code 1
     ... 25 more node_modules lines
-    ... 3 internal/modules lines
   Process exited with code 1
 ```
 
-### 2. Duplicate Read detection (~316k tokens/week saved)
-
-Tracks which files Claude has read in each session. When Claude re-reads a file it already has in context, the hook injects a warning:
-
-```
-  [savings: DUPLICATE READ] src/auth.ts was already read in this session
-  (4.2k chars re-added to context). The file content is already in your
-  conversation history. Use Read with offset/limit instead.
-```
-
-This warns only once per file (not on 3rd, 4th read) to avoid nagging.
-
-> **Why not compress Read output?** We tested it. 94% of edits to large files target the middle — exactly the part that would be stripped. Compressing Read would cause Claude to hallucinate or fail on nearly every edit. We measured this against 316 real Read→Edit sequences.
-
 ### 3. Loop detection (prevents 10-50k tokens per incident)
 
-Detects when Claude repeats the same tool call 3+ times with identical input and output — a sign it's stuck in a retry loop:
+Detects when Claude repeats the same tool call 3+ times with identical input and output:
 
 ```
   [savings: LOOP DETECTED] "npm test" has produced the same result 3 times.
   This is wasting tokens. Stop and try a different approach.
 ```
 
-Doesn't fire often in normal usage (0 times in our 107-session benchmark), but when it does fire, it prevents the worst token waste — Claude burning through thousands of tokens retrying a command that will never succeed.
+Rare in normal usage (0 times in our 107-session benchmark), but when it fires it prevents the worst token waste — Claude retrying a command that will never succeed.
 
 ## Cost savings
 
@@ -104,18 +115,17 @@ Doesn't fire often in normal usage (0 times in our 107-session benchmark), but w
 | 50 devs | Opus | $1,738 | **$20,856** |
 | 200 devs | Opus | $6,952 | **$83,424** |
 
-> Based on measured data: ~580k tokens saved per dev per week (264k from compression + 316k from duplicate read prevention).
+> Based on measured data: ~580k tokens saved per dev per week (316k from blocked duplicate reads + 264k from compression).
 
 ### How this makes Claude Code faster
 
-This hook doesn't speed up Claude's inference — it reduces the tokens Claude re-processes every turn:
+Less context = faster responses. Every token saved from a duplicate read or compressed output is one fewer token re-processed on every subsequent turn:
 
 ```
-  Turn 5:  Bash dumps 3,000 chars (750 tokens) into context
-  Turn 50: Still re-processing those 750 tokens — for the 45th time
-
-  With compression (3,000 → 400 chars):
-  Saved: 650 tokens × 45 remaining turns = 29,250 tokens NOT re-processed
+  Turn 5:  Claude reads auth.ts (4,000 chars / 1,000 tokens)
+  Turn 30: Claude tries to re-read auth.ts
+           → BLOCKED. Zero tokens added.
+           Without blocking: 1,000 tokens × 50 remaining turns = 50,000 tokens wasted
 ```
 
 Effects:
@@ -128,16 +138,15 @@ Effects:
 
 | | claude-savings | [contextzip](https://github.com/jee599/contextzip) | [clauditor](https://github.com/IyadhKhalfallah/clauditor) |
 |---|---|---|---|
-| **Strategies** | Compression + loop detection + dup read prevention | CLI output compression only | Session rotation + cache monitoring |
-| **Compresses** | Bash, Grep, Glob, WebFetch, WebSearch | CLI output only | Bash output only |
+| **Blocks duplicate reads** | **Yes (PreToolUse)** | No | No |
+| **Output compression** | Bash, Grep, Glob, WebFetch, WebSearch | CLI output only | Bash output only |
 | **Loop detection** | Yes (3+ identical calls) | No | Yes (Stop hook) |
-| **Duplicate reads** | Yes (warns on re-reads) | No | No |
-| **Stack traces** | Collapses framework frames | Collapses framework frames | No |
-| **Install** | Copy 1 file | `npx` or `cargo install` | `npm install -g` |
+| **Stack trace dedup** | Collapses framework frames | Collapses framework frames | No |
+| **Install** | Copy 2 files | `npx` or `cargo install` | `npm install -g` |
 | **Dependencies** | None | Rust binary + `jq` | 5 npm packages |
-| **Size** | 1 file, 280 lines | Full CLI + 6 filters | 31 files, TUI, daemon |
+| **Size** | 2 files, ~350 lines | Full CLI + 6 filters | 31 files, TUI, daemon |
 
-> **Why not compress Read output?** We tested it — 94% of edits target the middle of files. Compressing Read would break Claude's ability to edit code. We warn on duplicate reads instead.
+**Our edge:** We block the #1 token waste that nobody else addresses. Duplicate reads waste more tokens than all verbose output combined — and we're the only tool that prevents them.
 
 ## Install
 
@@ -149,7 +158,10 @@ curl -fsSL https://raw.githubusercontent.com/Cyvid7-Darus10/claude-savings/main/
 Or manually:
 
 ```bash
+# Download both hooks
 mkdir -p ~/.claude/hooks
+curl -o ~/.claude/hooks/pre-read.mjs \
+  https://raw.githubusercontent.com/Cyvid7-Darus10/claude-savings/main/pre-read.mjs
 curl -o ~/.claude/hooks/compress.mjs \
   https://raw.githubusercontent.com/Cyvid7-Darus10/claude-savings/main/compress.mjs
 ```
@@ -159,6 +171,17 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/hooks/pre-read.mjs\""
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "",
@@ -184,41 +207,37 @@ node compress.test.mjs
 
 ```
 ── Output Compression ──
-  ✓ Bash: passes through short output
-  ✓ Bash: compresses npm install
-  ✓ Bash: preserves error lines
-  ✓ Bash: collapses node_modules stack frames
-  ✓ Bash: collapses repeated lines
-  ✓ Grep / Glob / WebFetch / WebSearch
-  ✓ Read: never compressed
-  ✓ Edit/Write/Agent: never compressed
+  ✓ Bash: compresses npm install, preserves errors, collapses stack traces
+  ✓ Grep / Glob / WebFetch / WebSearch compression
+  ✓ Read: never compressed  |  Edit/Write/Agent: never compressed
 
 ── Loop Detection ──
-  ✓ no warning on first two identical calls
-  ✓ warns on third identical call
-  ✓ resets count when command changes
+  ✓ warns on 3rd identical call, resets on change
 
-── Duplicate Read Tracking ──
-  ✓ no warning on first read
-  ✓ warns on second read of same file
-  ✓ no warning for small files (<1k)
-  ✓ warns only once (not on 3rd, 4th read)
+── Duplicate Read Blocking (PreToolUse) ──
+  ✓ allows first read
+  ✓ blocks second read with same params
+  ✓ allows re-read with different offset/limit
+  ✓ passes through non-Read tools
 
 20 passed, 0 failed
 ```
 
 ## Configuration
 
-Edit the constants at the top of `compress.mjs`:
+Edit constants at the top of each file:
+
+**compress.mjs** (PostToolUse):
 
 | Constant | Default | Description |
 |---|---|---|
 | `MAX_CHARS` | 2000 | Maximum compressed output size |
-| `MIN_CHARS` | 500 | Output shorter than this passes through unchanged |
+| `MIN_CHARS` | 500 | Output shorter than this passes through |
 | `LOOP_THRESHOLD` | 3 | Identical calls before loop warning |
-| `SKIP_COMPRESS` | Read, Edit, Write, Agent, ... | Tools that are never compressed |
 
-State files are stored in `~/.claude-savings/` (loop counts and read history per session).
+**pre-read.mjs** (PreToolUse):
+
+Blocks any Read with identical `file_path` + `offset` + `limit` within the same session. State stored in `~/.claude-savings/read-cache.json`.
 
 ## License
 
