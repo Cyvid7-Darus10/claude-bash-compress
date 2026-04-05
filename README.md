@@ -1,8 +1,10 @@
 # claude-savings
 
-A lightweight Claude Code hook that saves tokens through output compression, loop detection, and duplicate read prevention.
+**The #1 token waste in Claude Code isn't verbose output — it's Claude re-reading files it already has in context.**
 
-Every tool result stays in the conversation forever. Verbose build logs, duplicate file reads, repeated failing commands — all waste tokens that could be spent on actual work. This hook catches all three automatically.
+We measured 107 real sessions and found that duplicate file reads waste **more tokens than all verbose bash/grep/web output combined**. No other tool catches this.
+
+claude-savings is a single-file Claude Code hook with three savings strategies: output compression, duplicate read prevention, and loop detection. One file, zero dependencies, 580k tokens saved per week — measured, not estimated.
 
 ![demo](https://vhs.charm.sh/vhs-XbmoXiyGHgFy0WwjYYjis.gif)
 
