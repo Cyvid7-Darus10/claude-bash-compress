@@ -67,20 +67,48 @@ The direct dollar savings are modest — the real value is **context window long
 - **Better cache hit rates.** Smaller tool outputs mean less cache churn. Claude Code's prompt caching works better when context grows predictably.
 - **Longer productive sessions.** On Sonnet (200k context), a session with 40 verbose bash calls adds ~60k tokens of noise — that's 30% of the window wasted on npm install logs. Compression recovers most of that.
 
-### Speed improvements
+### How this makes Claude Code faster
 
-Less context = faster responses. Claude processes fewer tokens per turn when bash output is compressed:
+This hook doesn't make Claude's model inference faster — that's determined by Anthropic's servers. What it does is reduce the number of tokens Claude has to **re-process on every subsequent turn**.
+
+Claude Code re-sends the **entire conversation history** on every turn. A verbose bash output from turn 5 is still being processed at turn 50:
 
 ```
-  Verbose session (no compression):
-    Turn 50: ~120k tokens input → 3-5 sec response latency
+  Turn 5:  npm install dumps 3,000 chars (750 tokens) into context
+  Turn 6:  Claude re-processes those 750 tokens
+  Turn 7:  And again
+  ...
+  Turn 50: Still processing those same 750 tokens — for the 45th time
+
+  With compression (3,000 → 400 chars, saving 650 tokens):
+  650 tokens × 45 remaining turns = 29,250 tokens NOT re-processed
+```
+
+Across a session with 15 verbose bash calls, that's **~400k fewer cumulative tokens processed**. Four concrete effects:
+
+1. **Faster time-to-first-token.** Less input to process before Claude starts responding. Not dramatic per-turn (~100-300ms), but noticeable in long sessions.
+
+2. **Lower chance of hitting rate limits.** Fewer tokens per request means more headroom before Anthropic throttles you.
+
+3. **Delayed compaction.** Sessions last longer before auto-compaction erases older context. On Sonnet (200k window), 15 verbose bash calls add ~40k tokens of noise — that's 20% of the window wasted on install logs. Compression recovers most of it.
+
+4. **Better prompt cache hit rates.** Claude Code uses prompt caching — repeated context is read from cache (10x cheaper) instead of reprocessed. Smaller, more stable context = more cache hits. Large bash output insertions cause cache misses that cascade through subsequent turns.
+
+```
+  Build-heavy session (50 bash calls, 100 turns):
+  ──────────────────────────────────────────────────
+  Without compression:
+    Cumulative bash noise:     ~50k tokens in context by turn 100
+    Tokens re-processed:       ~2.5M extra tokens over the session
+    Cache disruptions:         ~15 (each verbose output shifts cache boundaries)
 
   With bash-compress:
-    Turn 50: ~105k tokens input → 2-4 sec response latency
-    ~15% less input per turn → noticeably faster after 30+ turns
+    Cumulative bash noise:     ~12k tokens (76% less)
+    Tokens re-processed:       ~600k extra tokens (saved ~1.9M)
+    Cache disruptions:         ~3 (most output stays under cache threshold)
 ```
 
-The speedup compounds over longer sessions. By turn 100, the accumulated bash noise can add 30-50k tokens. Compressing it means every subsequent Claude response starts processing sooner.
+The speed improvement compounds. By turn 100 of a build-heavy session, you could be processing 30-50k fewer tokens per turn — that's measurably faster response times and significantly better cache economics.
 
 ### Enterprise scale
 
